@@ -1,0 +1,335 @@
+package main
+
+import (
+	context "context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	status "google.golang.org/grpc/status"
+)
+
+// type Admin_LoggingServer struct {
+// 	Send(*Event) error
+// 	grpc.ServerStream
+// }
+
+// type Admin_StatisticsServer struct {
+// 	Send(*Stat) error
+// 	grpc.ServerStream
+// }
+
+type AuthError struct {
+	message string
+}
+
+func (e AuthError) Error() string { return e.message }
+
+func (e AuthError) GRPCStatus() *status.Status { return status.New(codes.Unauthenticated, e.message) }
+
+func NewAuthError() *AuthError {
+	return &AuthError{message: "smth went wrong"} //todo more informative msg
+}
+
+type AdminServerImpl struct {
+	LogStreamsCh chan Admin_LoggingServer
+	LogStreams   []Admin_LoggingServer
+
+	StatStreamsCh chan StatData
+	// StatStreams   []Admin_StatisticsServer
+
+	EventsCh chan *Event
+	mu       *sync.Mutex
+	statsMu  *sync.Mutex
+	Host     string
+}
+
+type StatData struct {
+	statStream Admin_StatisticsServer
+	i          *StatInterval
+}
+
+func (as *AdminServerImpl) Logging(n *Nothing, inStream Admin_LoggingServer) error {
+	as.LogStreamsCh <- inStream
+	time.Sleep(time.Second * 10) // без слипа возвращается раньше, чем было послано сообщение
+
+	// fmt.Println("the real in stream:", inStream)
+	// inStream.Send(&Event{Timestamp: time.Now().Unix(), Consumer: "brat", Method: "bratan", Host: "bratishka"})
+	return nil
+}
+
+func (as *AdminServerImpl) Statistics(i *StatInterval, inStream Admin_StatisticsServer) error {
+	as.StatStreamsCh <- StatData{i: i, statStream: inStream}
+	time.Sleep(time.Second * 10)
+	return nil
+}
+
+func NewBizServerImpl() *BizServerImpl {
+	return &BizServerImpl{}
+}
+
+func NewAdminServerImpl(eventsCh chan *Event, streamsCh chan Admin_LoggingServer, streams []Admin_LoggingServer, host string, statStreamsCh chan StatData) *AdminServerImpl {
+	return &AdminServerImpl{LogStreamsCh: streamsCh, EventsCh: eventsCh, LogStreams: streams, mu: &sync.Mutex{}, statsMu: &sync.Mutex{}, Host: host, StatStreamsCh: statStreamsCh}
+}
+
+type BizServerImpl struct {
+}
+
+func (bs *BizServerImpl) Check(ctx context.Context, n *Nothing) (*Nothing, error) {
+	fmt.Println("Checking some business logic...")
+
+	return &Nothing{}, nil
+}
+
+func (bs *BizServerImpl) Add(ctx context.Context, n *Nothing) (*Nothing, error) {
+	fmt.Println("Adding...")
+	return &Nothing{}, nil
+}
+
+func (bs *BizServerImpl) Test(ctx context.Context, n *Nothing) (*Nothing, error) {
+	fmt.Println("Testing...")
+	return &Nothing{}, nil
+}
+
+func (bs *BizServerImpl) mustEmbedUnimplementedBizServer() {
+
+}
+
+func (as *AdminServerImpl) mustEmbedUnimplementedAdminServer() {
+
+}
+
+func StartMyMicroservice(ctx context.Context, listenAddr string, ACLData string) error {
+	ACLDataByte := []byte(ACLData)
+	var allowedMethodsByUser map[string][]string
+	err := json.Unmarshal(ACLDataByte, &allowedMethodsByUser)
+
+	if err != nil {
+		return err
+	}
+
+	lis, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		log.Fatalln("can't listen port", err)
+	}
+
+	allowedMethodsByUserMap := make(map[string]map[string]bool)
+	for user, methods := range allowedMethodsByUser {
+		allowedMethods := make(map[string]bool, len(methods))
+		for _, m := range methods {
+			allowedMethods[m] = true
+		}
+		allowedMethodsByUserMap[user] = allowedMethods
+	}
+
+	eventsCh := make(chan *Event)
+
+	hostParts := strings.Split(listenAddr, ":")
+	var host string
+	if len(hostParts) > 0 {
+		host = hostParts[0] + ":"
+	}
+	interceptor := NewAuthInterceptor(allowedMethodsByUserMap, eventsCh, host)
+	unary := interceptor.Unary()
+	stream := interceptor.Stream()
+	server := grpc.NewServer(
+		grpc.UnaryInterceptor(unary),
+		grpc.StreamInterceptor(stream),
+	)
+
+	RegisterBizServer(server, NewBizServerImpl())
+
+	logStreamsCh := make(chan Admin_LoggingServer)
+	logStreams := make([]Admin_LoggingServer, 0)
+	statStreamsCh := make(chan StatData)
+	// statStreams := make([]Admin_StatisticsServer, 0)
+	as := NewAdminServerImpl(eventsCh, logStreamsCh, logStreams, host, statStreamsCh)
+	RegisterAdminServer(server, as)
+
+	// multiplexing logs and stats
+	stats := make([]*Stat, 0)
+	// statsByMethod := make([]map[string]uint64, 0)
+	// statsByConsumer := make([]map[string]uint64, 0)
+	go func() {
+	LOOP:
+		for {
+			select {
+			case e, ok := <-eventsCh:
+				if !ok {
+					break LOOP
+				}
+
+				for i := 0; i < len(logStreams); i++ {
+					logStreams[i].Send(e)
+				}
+
+				as.statsMu.Lock()
+				fmt.Println("stats is", stats)
+				fmt.Println("stat len is", len(stats))
+				for i := 0; i < len(stats); i++ {
+					(*stats[i]).ByMethod[e.Method]++
+					(*stats[i]).ByConsumer[e.Consumer]++
+				}
+				as.statsMu.Unlock()
+				// неверно
+				// as.statsMu.Lock()
+				// statByMethod[e.Method]++
+				// statByConsumer[e.Consumer]++
+				// as.statsMu.Unlock()
+			case s, ok := <-logStreamsCh:
+				if !ok {
+					break LOOP
+				}
+				as.mu.Lock()
+				logStreams = append(logStreams, s)
+				as.mu.Unlock()
+			case ss, ok := <-statStreamsCh:
+				if !ok {
+					break LOOP
+				}
+				as.statsMu.Lock()
+				// statStreams = append(statStreams, ss.statStream)
+				stat := &Stat{ByConsumer: make(map[string]uint64), ByMethod: make(map[string]uint64)}
+				stats = append(stats, stat)
+				as.statsMu.Unlock()
+				// после добавления надо начинать отсчёт
+				go func() {
+					for {
+						select {
+						case <-time.After(time.Duration(ss.i.IntervalSeconds) * time.Second):
+							as.statsMu.Lock()
+							// for i := 0; i < len(statStreams); i++ {
+							ss.statStream.Send(stat)
+							stat.Timestamp = 0
+							stat.ByMethod = make(map[string]uint64)
+							stat.ByConsumer = make(map[string]uint64)
+							// }
+							as.statsMu.Unlock()
+						}
+					}
+				}()
+			}
+		}
+	}()
+
+	go func() {
+
+	}()
+
+	go server.Serve(lis)
+	go stopOnCancel(server, ctx, eventsCh, logStreamsCh, statStreamsCh)
+
+	return nil
+}
+
+func NewAuthInterceptor(ACLData map[string]map[string]bool, eventsCh chan *Event, Host string) *AuthInterceptor {
+	return &AuthInterceptor{ACLData: ACLData, EventsCh: eventsCh, Host: Host}
+}
+
+type AuthInterceptor struct {
+	// todo add mutex
+	ACLData  map[string]map[string]bool
+	EventsCh chan *Event
+	Host     string
+}
+
+func (interceptor *AuthInterceptor) Unary() grpc.UnaryServerInterceptor {
+	return func(
+		ctx context.Context,
+		req interface{},
+		info *grpc.UnaryServerInfo,
+		handler grpc.UnaryHandler,
+	) (interface{}, error) {
+		fmt.Println("--> unary interceptor")
+		md, _ := metadata.FromIncomingContext(ctx)
+		consumer := md.Get("consumer")
+		if len(consumer) == 0 {
+			return nil, NewAuthError()
+		}
+
+		err := interceptor.authorize(ctx, info.FullMethod, consumer[0])
+		if err != nil {
+			return nil, err
+		}
+
+		fmt.Println("adding unary event to channel")
+		interceptor.EventsCh <- &Event{Timestamp: time.Now().Unix(), Consumer: consumer[0], Method: info.FullMethod, Host: interceptor.Host}
+
+		return handler(ctx, req)
+	}
+}
+
+func (interceptor *AuthInterceptor) Stream() grpc.StreamServerInterceptor {
+	return func(
+		srv interface{},
+		stream grpc.ServerStream,
+		info *grpc.StreamServerInfo,
+		handler grpc.StreamHandler,
+	) error {
+		fmt.Println("--> stream interceptor")
+		md, _ := metadata.FromIncomingContext(stream.Context())
+		consumer := md.Get("consumer")
+		if len(consumer) == 0 {
+			return NewAuthError()
+		}
+
+		err := interceptor.authorize(stream.Context(), info.FullMethod, consumer[0])
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("adding event to channel")
+		interceptor.EventsCh <- &Event{Timestamp: time.Now().Unix(), Consumer: consumer[0], Method: info.FullMethod, Host: interceptor.Host}
+
+		return handler(srv, stream)
+	}
+}
+
+func (interceptor *AuthInterceptor) authorize(ctx context.Context, method string, consumer string) error {
+	// fmt.Println(method)
+	// fmt.Println(AuthInterceptor.ACLData)
+	if allowedMethods, ok := interceptor.ACLData[consumer]; !ok {
+		return NewAuthError()
+	} else if !match(allowedMethods, method) {
+		return NewAuthError()
+	}
+
+	return nil
+}
+
+func match(allowedMethods map[string]bool, method string) bool {
+	if _, ok := allowedMethods[method]; ok {
+		return true
+	}
+	for methodMask := range allowedMethods {
+		if matched, _ := regexp.MatchString(methodMask, method); matched {
+			return true
+		}
+	}
+
+	return false
+}
+
+func stopOnCancel(server *grpc.Server, ctx context.Context, eventsCh chan *Event, streamsCh chan Admin_LoggingServer, statStreamsCh chan StatData) {
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			close(eventsCh)
+			close(streamsCh)
+			close(statStreamsCh)
+			// при вызове этой функции ваш сервер должен остановиться и освободить порт
+			server.Stop()
+			break LOOP
+		}
+	}
+}
+

@@ -1,0 +1,104 @@
+package main
+
+import (
+	"reflect"
+)
+
+func main() {
+
+}
+
+type TypeMismatchError struct {
+	message string
+}
+
+func (e TypeMismatchError) Error() string {
+	return e.message
+}
+
+func NewTypeMismatchError() *TypeMismatchError {
+	return &TypeMismatchError{message: "some not very informative message"}
+}
+
+func i2s(data interface{}, out interface{}) error {
+	if reflect.TypeOf(out).Kind() != reflect.Ptr {
+		return NewTypeMismatchError()
+	}
+	err := goUnder(data, reflect.ValueOf(out).Elem())
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func goUnder(data interface{}, field reflect.Value) error {
+	v := reflect.ValueOf(data)
+	kind1 := reflect.TypeOf(field.Interface()).Kind()
+	switch reflect.ValueOf(data).Kind() {
+	case reflect.Slice:
+		if kind1 != reflect.Slice {
+			return NewTypeMismatchError()
+		}
+		slice := reflect.MakeSlice(field.Type(), v.Len(), v.Len())
+		field.Set(slice)
+		for i := 0; i < v.Len(); i++ {
+			switch vtt := v.Index(i).Interface().(type) {
+			default:
+				goUnder(vtt, slice.Index(i))
+			}
+		}
+	case reflect.Map:
+		if kind1 != reflect.Struct {
+			return NewTypeMismatchError()
+		}
+		for _, key := range v.MapKeys() {
+			val := v.MapIndex(key)
+			fieldInternal := field.FieldByName(key.String())
+			kind := reflect.TypeOf(fieldInternal.Interface()).Kind()
+			switch vt := val.Interface().(type) {
+			case float64:
+				if kind != reflect.Int {
+					return NewTypeMismatchError()
+				}
+				fieldInternal.SetInt(int64(vt))
+			case string:
+				if kind != reflect.String {
+					return NewTypeMismatchError()
+				}
+				fieldInternal.SetString(val.Interface().(string))
+			case bool:
+				if kind != reflect.Bool {
+					return NewTypeMismatchError()
+				}
+				fieldInternal.SetBool(val.Interface().(bool))
+			default:
+				f := field.FieldByName(key.String())
+				switch f.Type().Kind() {
+				case reflect.Struct:
+					if reflect.TypeOf(vt).Kind() != reflect.Map {
+						return NewTypeMismatchError()
+					}
+					goUnder(vt, f)
+				case reflect.Slice:
+					if reflect.TypeOf(vt).Kind() != reflect.Slice {
+						return NewTypeMismatchError()
+					}
+					sv := reflect.ValueOf(vt)
+					slice := reflect.MakeSlice(f.Type(), sv.Len(), sv.Len())
+
+					field.FieldByName(key.String()).Set(slice)
+					for i := 0; i < sv.Len(); i++ {
+						switch vtt := sv.Index(i).Interface().(type) {
+						default:
+							goUnder(vtt, slice.Index(i))
+						}
+					}
+				}
+			}
+		}
+
+	}
+
+	return nil
+}
